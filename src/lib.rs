@@ -1,4 +1,4 @@
-mod job;
+pub mod job;
 pub mod job_builder;
 pub mod job_post_processing;
 mod job_status;
