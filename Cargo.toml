@@ -2,6 +2,14 @@
 name = "slurm_manager"
 version = "0.0.1"
 edition = "2024"
-
+license = "LGPL-3.0"
+description = "Utilities to create and manage SLURM jobs."
+homepage = "https://github.com/simkoc/slurm_manager"
+repository = "https://github.com/simkoc/slurm_manager"
+readme = "README.md"
 
 [dependencies]
+chrono = "0.4.44"
+log = "0.4.29"
+uuid = { version = "1.21.0", features = ["v4"] }
+log4rs = "1.4.0-rc2"
