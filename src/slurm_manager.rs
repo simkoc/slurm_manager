@@ -220,12 +220,11 @@ impl SlurmManager {
 
 #[cfg(test)]
 mod tests {
-    use crate::job_builder::SlurmJobBuilder;
-    use crate::job_post_processing::SlurmJobPostProcessing;
-    use log4rs::config::Deserializers;
-    use serial_test::serial;
     //use crate::logging::Logger;
     use super::*;
+    use crate::job_builder::SlurmJobBuilder;
+    use crate::job_post_processing::SlurmJobPostProcessing;
+    use serial_test::serial;
 
     fn init_logger() {
         //todo: do we need to init anything here?
