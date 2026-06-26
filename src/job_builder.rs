@@ -58,12 +58,31 @@ impl SlurmJobBuilder {
         self
     }
 
-    fn check_max_runtime_pattern(_pattern: &String) -> bool {
-        true
+    // Validates the SLURM time format D-HH:MM:SS required by --time.
+    fn check_max_runtime_pattern(pattern: &str) -> bool {
+        let parts: Vec<&str> = pattern.splitn(2, '-').collect();
+        if parts.len() != 2 {
+            return false;
+        }
+        if parts[0].parse::<u32>().is_err() {
+            return false;
+        }
+        let hms: Vec<&str> = parts[1].split(':').collect();
+        if hms.len() != 3 {
+            return false;
+        }
+        let hours: u32 = match hms[0].parse() { Ok(v) => v, Err(_) => return false };
+        let minutes: u32 = match hms[1].parse() { Ok(v) => v, Err(_) => return false };
+        let seconds: u32 = match hms[2].parse() { Ok(v) => v, Err(_) => return false };
+        hours < 24 && minutes < 60 && seconds < 60
     }
 
     pub fn set_max_run_time(mut self, max_run_time: String) -> SlurmJobBuilder {
-        assert!(Self::check_max_runtime_pattern(&max_run_time));
+        assert!(
+            Self::check_max_runtime_pattern(&max_run_time),
+            "invalid max_run_time format, expected D-HH:MM:SS, got: {}",
+            max_run_time
+        );
         self.max_run_time = Some(max_run_time);
         self
     }
@@ -104,5 +123,34 @@ impl SlurmJobBuilder {
             memory: self.memory.clone(),
             cpus: self.cpus,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_runtime_pattern_valid_zero_days() {
+        assert!(SlurmJobBuilder::check_max_runtime_pattern("0-00:00:00"));
+    }
+
+    #[test]
+    fn max_runtime_pattern_valid_nonzero() {
+        assert!(SlurmJobBuilder::check_max_runtime_pattern("3-12:30:59"));
+    }
+
+    #[test]
+    fn max_runtime_pattern_invalid_format() {
+        assert!(!SlurmJobBuilder::check_max_runtime_pattern("00:05:00"));
+        assert!(!SlurmJobBuilder::check_max_runtime_pattern("not-a-time"));
+        assert!(!SlurmJobBuilder::check_max_runtime_pattern("1-25:00:00"));
+        assert!(!SlurmJobBuilder::check_max_runtime_pattern("1-00:60:00"));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid max_run_time format")]
+    fn set_max_run_time_panics_on_bad_input() {
+        SlurmJobBuilder::new("sleep 1".to_string()).set_max_run_time("badformat".to_string());
     }
 }

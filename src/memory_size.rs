@@ -1,6 +1,6 @@
 #[derive(Clone)]
 pub enum Memory {
-    MegaByte(i32),
+    MegaByte(u32),
     #[allow(unused)]
-    GigaByte(i32),
+    GigaByte(u32),
 }

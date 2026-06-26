@@ -203,6 +203,9 @@ impl SlurmManager {
                     }
                 }
                 Result::Err(why) => {
+                    for e in &why {
+                        error!("scheduling error: {:?}", e);
+                    }
                     error!("while scheduling jobs we encountered {} errors", why.len());
                 }
             }
@@ -228,10 +231,6 @@ mod tests {
 
     fn init_logger() {
         //todo: do we need to init anything here?
-    }
-
-    fn always_success() -> SlurmJobPostProcessing {
-        SlurmJobPostProcessing::new(&[], |_| true)
     }
 
     fn sleep_job(wdir: Option<String>) -> SlurmJob {
@@ -265,12 +264,42 @@ popd
     fn generate_full_script() {
         let job = sleep_job(None);
         let mut expected: String = String::from("#!/bin/bash\n");
-        expected += format!("#SBATCH --job-name={}\n\n\nsleep 5\n", job.get_id()).as_str();
+        expected += format!("#SBATCH --job-name={}\n", job.get_id()).as_str();
+        expected += "#SBATCH --output=/dev/null\n";
+        expected += "#SBATCH --error=/dev/null\n";
+        expected += "#SBATCH --cpus-per-task=1\n";
+        expected += "#SBATCH --mem=100M\n";
+        expected += "\n\n";
+        expected += "echo START: `date +%Y-%m-%dT%H:%M:%S%z`\n";
+        expected += "sleep 5\n";
+        expected += "\necho END: `date +%Y-%m-%dT%H:%M:%S%z`\n";
         assert_eq!(job.generate_slurm_script(), expected);
     }
 
     #[test]
+    fn generate_full_script_with_all_options() {
+        use crate::memory_size::Memory::GigaByte;
+        let job = SlurmJobBuilder::new(String::from("sleep 5"))
+            .set_output_file("out.log".to_string())
+            .set_error_file("err.log".to_string())
+            .set_cpus(4)
+            .set_memory(GigaByte(8))
+            .set_max_run_time("1-02:30:00".to_string())
+            .set_working_directory("/tmp/".to_string())
+            .build();
+        let script = job.generate_slurm_script();
+        assert!(script.contains("#SBATCH --output=out.log\n"));
+        assert!(script.contains("#SBATCH --error=err.log\n"));
+        assert!(script.contains("#SBATCH --cpus-per-task=4\n"));
+        assert!(script.contains("#SBATCH --mem=8G\n"));
+        assert!(script.contains("#SBATCH --time=1-02:30:00\n"));
+        assert!(script.contains("pushd /tmp/\n"));
+        assert!(script.contains("popd\n"));
+    }
+
+    #[test]
     #[serial]
+    #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
     fn create_and_run_jobs() {
         let job = sleep_job(None);
         init_logger();
@@ -288,6 +317,7 @@ popd
 
     #[test]
     #[serial]
+    #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
     fn create_and_run_multiple_jobs() {
         let job_one = sleep_job(None);
         let job_two = sleep_job(None);
@@ -302,5 +332,47 @@ popd
         assert_eq!(scheduled, 2);
         assert_eq!(running, 2);
         assert!(done);
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
+    fn manage_jobs_returns_false_when_time_runs_out() {
+        // sleep 30 won't finish within the 1-second budget
+        let job = SlurmJobBuilder::new(String::from("sleep 30")).build();
+        let mut manager = SlurmManager::new(1);
+        manager.add_job(&job);
+        let all_done = manager.manage_jobs(Some(1));
+        assert!(!all_done, "manage_jobs should return false when the time limit expires before all jobs finish");
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
+    fn crashed_job_not_counted_as_successful() {
+        let always_fail = SlurmJobPostProcessing::new(&[], |_| false);
+        let job = SlurmJobBuilder::new(String::from("sleep 5"))
+            .set_on_finished(always_fail)
+            .build();
+        let mut manager = SlurmManager::new(1);
+        manager.add_job(&job);
+        manager.manage_jobs(Some(15));
+        assert_eq!(
+            manager.successful_jobs(),
+            0,
+            "a job whose post-processing fails should not be counted as successful"
+        );
+    }
+
+    #[test]
+    fn post_processing_check_returns_false_on_failure() {
+        let failing = SlurmJobPostProcessing::new(&[], |_| false);
+        assert!(!failing.check(), "post-processing returning false should propagate as false");
+    }
+
+    #[test]
+    fn post_processing_check_returns_true_on_success() {
+        let succeeding = SlurmJobPostProcessing::new(&[], |_| true);
+        assert!(succeeding.check());
     }
 }
