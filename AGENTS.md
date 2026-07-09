@@ -25,5 +25,4 @@ The library interacts with SLURM only through `std::process::Command` (`sbatch`,
 
 - The `TMP_DIR` environment variable controls where temporary `.slurm` script files are written (default: `/tmp/`).
 - `SlurmJobPostProcessing` callbacks determine whether a finished job counts as `FINISHED` or `CRASHED`.
-- `check_max_runtime_pattern` in `job_builder.rs` is a stub — it always returns `true`. Any contributor adding real validation should also add the corresponding failure-case test.
-- The `env` field on `SlurmJob` is parsed but not yet written into the generated script. Do not rely on it until that gap is closed.
+- The `env` field on `SlurmJob` is stored but not emitted into the generated script. Do not rely on it until that gap is closed.
