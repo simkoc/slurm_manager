@@ -217,7 +217,7 @@ impl SlurmManager {
             );
             thread::sleep(Duration::from_secs(5)); // wait for 5 seconds and then update jobs
         }
-        self.open_jobs.is_empty()
+        self.open_jobs.is_empty() && self.scheduled_jobs.is_empty()
     }
 }
 
@@ -240,6 +240,27 @@ mod tests {
             Some(dir) => job.set_working_directory(String::from(dir)).build(),
             None => job.build(),
         }
+    }
+
+    // Unique path for a file a job can `touch` as a side-effect marker of
+    // having actually completed its command (as opposed to being killed
+    // by SLURM for exceeding a time or memory limit).
+    fn marker_path() -> String {
+        let tmp_dir = std::env::var("TMP_DIR").unwrap_or_else(|_| String::from("/tmp/"));
+        format!("{}marker_{}", tmp_dir, uuid::Uuid::new_v4())
+    }
+
+    fn marker_exists(path: &str) -> bool {
+        std::path::Path::new(path).exists()
+    }
+
+    // Post-processing that succeeds only if the job actually ran its
+    // command to completion and left the marker file behind.
+    fn marker_post_processing(marker: &str) -> SlurmJobPostProcessing {
+        SlurmJobPostProcessing::new(
+            &[("marker".to_string(), marker.to_string())],
+            |params| std::path::Path::new(&params["marker"]).exists(),
+        )
     }
 
     #[test]
@@ -308,7 +329,7 @@ popd
         let pre_start = manager.check_on_jobs().expect("Should have checked no job");
         let scheduled = manager.fill_up_queue().expect("Couldn't fill up queue");
         let running = manager.get_running_jobs().expect("get running jobs").len();
-        let done = manager.manage_jobs(Some(10));
+        let done = manager.manage_jobs(Some(20));
         assert_eq!(pre_start, 0);
         assert_eq!(scheduled, 1);
         assert_eq!(running, 1);
@@ -327,7 +348,7 @@ popd
         let pre_start = manager.check_on_jobs().expect("Should have checked no job");
         let scheduled = manager.fill_up_queue().expect("Couldn't fill up queue");
         let running = manager.get_running_jobs().expect("get running jobs").len();
-        let done = manager.manage_jobs(Some(10));
+        let done = manager.manage_jobs(Some(20));
         assert_eq!(pre_start, 0);
         assert_eq!(scheduled, 2);
         assert_eq!(running, 2);
@@ -338,12 +359,110 @@ popd
     #[serial]
     #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
     fn manage_jobs_returns_false_when_time_runs_out() {
-        // sleep 30 won't finish within the 1-second budget
+        // sleep 30 won't finish within the 5-second budget
         let job = SlurmJobBuilder::new(String::from("sleep 30")).build();
         let mut manager = SlurmManager::new(1);
         manager.add_job(&job);
-        let all_done = manager.manage_jobs(Some(1));
+        let all_done = manager.manage_jobs(Some(5));
         assert!(!all_done, "manage_jobs should return false when the time limit expires before all jobs finish");
+        assert!(
+            !(manager.open_jobs.is_empty() && manager.scheduled_jobs.is_empty()),
+            "the unfinished job should still be tracked (open or scheduled), not silently dropped"
+        );
+        // the job is intentionally left running by this test; cancel it so it
+        // doesn't linger in squeue and pollute subsequent tests
+        for job in &manager.scheduled_jobs {
+            let _ = std::process::Command::new("scancel")
+                .arg(job.get_number().to_string())
+                .output();
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
+    fn slurm_time_limit_kills_job() {
+        // the job would take 30s but is only allowed 5s by SLURM's --time
+        let marker = marker_path();
+        let _ = std::fs::remove_file(&marker);
+        let job = SlurmJobBuilder::new(format!("sleep 30 && touch {}", marker))
+            .set_max_run_time("0-00:00:05".to_string())
+            .set_on_finished(marker_post_processing(&marker))
+            .build();
+        let mut manager = SlurmManager::new(1);
+        manager.add_job(&job);
+        manager.manage_jobs(Some(30));
+        assert!(
+            !marker_exists(&marker),
+            "job killed by the SLURM time limit should never reach the `touch` command"
+        );
+        assert_eq!(
+            manager.successful_jobs(),
+            0,
+            "a job killed by the SLURM time limit must not be counted as successful"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "requires a live SLURM cluster with memory-limit enforcement (cgroups) enabled (run with --include-ignored)"]
+    fn memory_limit_kills_job() {
+        // allocate 200MB of tmpfs-backed memory against a 50MB SLURM cap
+        let marker = marker_path();
+        let bigfile = format!("/dev/shm/slurm_test_bigfile_{}", uuid::Uuid::new_v4());
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&bigfile);
+        let command = format!(
+            "dd if=/dev/zero of={} bs=1M count=200 && touch {} && rm -f {}",
+            bigfile, marker, bigfile
+        );
+        let job = SlurmJobBuilder::new(command)
+            .set_memory(crate::memory_size::Memory::MegaByte(50))
+            .set_on_finished(marker_post_processing(&marker))
+            .build();
+        let mut manager = SlurmManager::new(1);
+        manager.add_job(&job);
+        manager.manage_jobs(Some(60));
+        assert!(
+            !marker_exists(&marker),
+            "job exceeding its memory limit should be OOM-killed before writing the marker"
+        );
+        assert_eq!(
+            manager.successful_jobs(),
+            0,
+            "an OOM-killed job must not be counted as successful"
+        );
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_file(&bigfile);
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
+    fn queue_cap_never_exceeded() {
+        let max_queue = 2;
+        let mut manager = SlurmManager::new(max_queue);
+        for _ in 0..6 {
+            manager.add_job(&sleep_job(None));
+        }
+        let end_time = Local::now() + TimeDelta::seconds(60);
+        loop {
+            manager.check_on_jobs().expect("check on jobs");
+            manager.fill_up_queue().expect("fill up queue");
+            let running = manager.get_running_jobs().expect("get running jobs").len() as i32;
+            assert!(
+                running <= max_queue,
+                "queue cap of {} exceeded: {} jobs running",
+                max_queue,
+                running
+            );
+            if manager.open_jobs.is_empty() && manager.scheduled_jobs.is_empty() {
+                break;
+            }
+            assert!(Local::now() < end_time, "jobs did not complete within the test budget");
+            thread::sleep(Duration::from_secs(2));
+        }
     }
 
     #[test]
