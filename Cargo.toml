@@ -2,7 +2,7 @@
 name = "slurm_manager"
 version = "0.1.1"
 edition = "2024"
-license = "LGPL-3.0"
+license = "MIT"
 description = "Utilities to create and manage SLURM jobs."
 homepage = "https://github.com/simkoc/slurm_manager"
 repository = "https://github.com/simkoc/slurm_manager"
