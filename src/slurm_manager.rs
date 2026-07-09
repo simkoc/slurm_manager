@@ -257,10 +257,9 @@ mod tests {
     // Post-processing that succeeds only if the job actually ran its
     // command to completion and left the marker file behind.
     fn marker_post_processing(marker: &str) -> SlurmJobPostProcessing {
-        SlurmJobPostProcessing::new(
-            &[("marker".to_string(), marker.to_string())],
-            |params| std::path::Path::new(&params["marker"]).exists(),
-        )
+        SlurmJobPostProcessing::new(&[("marker".to_string(), marker.to_string())], |params| {
+            std::path::Path::new(&params["marker"]).exists()
+        })
     }
 
     #[test]
@@ -364,7 +363,10 @@ popd
         let mut manager = SlurmManager::new(1);
         manager.add_job(&job);
         let all_done = manager.manage_jobs(Some(5));
-        assert!(!all_done, "manage_jobs should return false when the time limit expires before all jobs finish");
+        assert!(
+            !all_done,
+            "manage_jobs should return false when the time limit expires before all jobs finish"
+        );
         assert!(
             !(manager.open_jobs.is_empty() && manager.scheduled_jobs.is_empty()),
             "the unfinished job should still be tracked (open or scheduled), not silently dropped"
@@ -460,7 +462,10 @@ popd
             if manager.open_jobs.is_empty() && manager.scheduled_jobs.is_empty() {
                 break;
             }
-            assert!(Local::now() < end_time, "jobs did not complete within the test budget");
+            assert!(
+                Local::now() < end_time,
+                "jobs did not complete within the test budget"
+            );
             thread::sleep(Duration::from_secs(2));
         }
     }
@@ -486,7 +491,10 @@ popd
     #[test]
     fn post_processing_check_returns_false_on_failure() {
         let failing = SlurmJobPostProcessing::new(&[], |_| false);
-        assert!(!failing.check(), "post-processing returning false should propagate as false");
+        assert!(
+            !failing.check(),
+            "post-processing returning false should propagate as false"
+        );
     }
 
     #[test]

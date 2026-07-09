@@ -71,9 +71,18 @@ impl SlurmJobBuilder {
         if hms.len() != 3 {
             return false;
         }
-        let hours: u32 = match hms[0].parse() { Ok(v) => v, Err(_) => return false };
-        let minutes: u32 = match hms[1].parse() { Ok(v) => v, Err(_) => return false };
-        let seconds: u32 = match hms[2].parse() { Ok(v) => v, Err(_) => return false };
+        let hours: u32 = match hms[0].parse() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let minutes: u32 = match hms[1].parse() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let seconds: u32 = match hms[2].parse() {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
         hours < 24 && minutes < 60 && seconds < 60
     }
 
