@@ -15,11 +15,21 @@ enum SlurmInteractionError {
     SlurmUnresponsive(#[allow(unused)] String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManageJobsOutcome {
+    AllFinished,
+    TimedOut,
+    Aborted,
+}
+
 pub struct SlurmManager {
     open_jobs: Vec<SlurmJob>,
     scheduled_jobs: Vec<SlurmJob>,
     finished_jobs: Vec<SlurmJob>,
     max_queue: i32,
+    // set when a job's post-processing reports PostProcessingOutcome::Fatal;
+    // checked by manage_jobs alongside abort_if.
+    fatal_signal: bool,
 }
 
 impl SlurmManager {
@@ -29,6 +39,7 @@ impl SlurmManager {
             scheduled_jobs: Vec::new(),
             finished_jobs: Vec::new(),
             max_queue,
+            fatal_signal: false,
         }
     }
 
@@ -108,8 +119,15 @@ impl SlurmManager {
         done.reverse();
         for elem in done {
             let mut finished_job = self.scheduled_jobs.remove(elem);
-            let status = finished_job.run_post_processing();
+            let (status, fatal) = finished_job.run_post_processing();
             finished_job.set_status(status);
+            if fatal {
+                error!(
+                    "job {} signaled a fatal error via post-processing; remaining jobs will be aborted",
+                    finished_job.get_id()
+                );
+                self.fatal_signal = true;
+            }
             self.finished_jobs.push(finished_job);
         }
         Result::Ok(finished_jobs)
@@ -177,16 +195,60 @@ impl SlurmManager {
         }
     }
 
-    // start scheduling jobs, return true if all jobs are done
-    pub fn manage_jobs(&mut self, for_sec: Option<i64>) -> bool {
+    fn cancel_job(job: &SlurmJob) {
+        match std::process::Command::new("scancel")
+            .arg(job.get_number().to_string())
+            .output()
+        {
+            Ok(_) => {}
+            Err(bad) => error!("failed to cancel job {}: {}", job.get_number(), bad),
+        }
+    }
+
+    // cancel every scheduled job and move open/scheduled jobs into
+    // finished_jobs with ABORTED status.
+    fn abort(&mut self, reason: &str) {
+        warn!(
+            "manage_jobs aborted: {}, {} jobs still open/scheduled",
+            reason,
+            self.open_jobs.len() + self.scheduled_jobs.len()
+        );
+        for job in &self.scheduled_jobs {
+            Self::cancel_job(job);
+        }
+        for mut job in self.open_jobs.drain(..) {
+            job.set_status(SlurmJobStatus::ABORTED);
+            self.finished_jobs.push(job);
+        }
+        for mut job in self.scheduled_jobs.drain(..) {
+            job.set_status(SlurmJobStatus::ABORTED);
+            self.finished_jobs.push(job);
+        }
+    }
+
+    // start scheduling jobs, run until all jobs are done, time runs out, or abort_if signals
+    pub fn manage_jobs(
+        &mut self,
+        for_sec: Option<i64>,
+        abort_if: &dyn Fn() -> bool,
+    ) -> ManageJobsOutcome {
         let max_time_delta = 365 * 24 * 60; // one year worth of seconds
         let end_time = Local::now() + TimeDelta::seconds(for_sec.unwrap_or_else(|| max_time_delta));
+        self.fatal_signal = false;
         loop {
-            // run loop until either the time is up
-            if Local::now() >= end_time
-                || (self.open_jobs.is_empty() && self.scheduled_jobs.is_empty())
-            {
-                break;
+            if self.open_jobs.is_empty() && self.scheduled_jobs.is_empty() {
+                return ManageJobsOutcome::AllFinished;
+            }
+            if Local::now() >= end_time {
+                return ManageJobsOutcome::TimedOut;
+            }
+            if self.fatal_signal {
+                self.abort("a job signaled a fatal error via post-processing");
+                return ManageJobsOutcome::Aborted;
+            }
+            if abort_if() {
+                self.abort("abort_if signaled");
+                return ManageJobsOutcome::Aborted;
             }
             match self.check_on_jobs() {
                 Result::Ok(finished_jobs) => {
@@ -217,7 +279,6 @@ impl SlurmManager {
             );
             thread::sleep(Duration::from_secs(5)); // wait for 5 seconds and then update jobs
         }
-        self.open_jobs.is_empty() && self.scheduled_jobs.is_empty()
     }
 }
 
@@ -226,7 +287,7 @@ mod tests {
     //use crate::logging::Logger;
     use super::*;
     use crate::job_builder::SlurmJobBuilder;
-    use crate::job_post_processing::SlurmJobPostProcessing;
+    use crate::job_post_processing::{PostProcessingOutcome, SlurmJobPostProcessing};
     use serial_test::serial;
 
     fn init_logger() {
@@ -258,7 +319,23 @@ mod tests {
     // command to completion and left the marker file behind.
     fn marker_post_processing(marker: &str) -> SlurmJobPostProcessing {
         SlurmJobPostProcessing::new(&[("marker".to_string(), marker.to_string())], |params| {
-            std::path::Path::new(&params["marker"]).exists()
+            if std::path::Path::new(&params["marker"]).exists() {
+                PostProcessingOutcome::Success
+            } else {
+                PostProcessingOutcome::Failure
+            }
+        })
+    }
+
+    // Post-processing that reports Fatal if the marker file is present,
+    // simulating a job detecting a systemic setup failure.
+    fn fatal_if_marker_post_processing(marker: &str) -> SlurmJobPostProcessing {
+        SlurmJobPostProcessing::new(&[("marker".to_string(), marker.to_string())], |params| {
+            if std::path::Path::new(&params["marker"]).exists() {
+                PostProcessingOutcome::Fatal
+            } else {
+                PostProcessingOutcome::Success
+            }
         })
     }
 
@@ -328,11 +405,11 @@ popd
         let pre_start = manager.check_on_jobs().expect("Should have checked no job");
         let scheduled = manager.fill_up_queue().expect("Couldn't fill up queue");
         let running = manager.get_running_jobs().expect("get running jobs").len();
-        let done = manager.manage_jobs(Some(20));
+        let outcome = manager.manage_jobs(Some(20), &|| false);
         assert_eq!(pre_start, 0);
         assert_eq!(scheduled, 1);
         assert_eq!(running, 1);
-        assert!(done);
+        assert_eq!(outcome, ManageJobsOutcome::AllFinished);
     }
 
     #[test]
@@ -347,11 +424,11 @@ popd
         let pre_start = manager.check_on_jobs().expect("Should have checked no job");
         let scheduled = manager.fill_up_queue().expect("Couldn't fill up queue");
         let running = manager.get_running_jobs().expect("get running jobs").len();
-        let done = manager.manage_jobs(Some(20));
+        let outcome = manager.manage_jobs(Some(20), &|| false);
         assert_eq!(pre_start, 0);
         assert_eq!(scheduled, 2);
         assert_eq!(running, 2);
-        assert!(done);
+        assert_eq!(outcome, ManageJobsOutcome::AllFinished);
     }
 
     #[test]
@@ -362,10 +439,11 @@ popd
         let job = SlurmJobBuilder::new(String::from("sleep 30")).build();
         let mut manager = SlurmManager::new(1);
         manager.add_job(&job);
-        let all_done = manager.manage_jobs(Some(5));
-        assert!(
-            !all_done,
-            "manage_jobs should return false when the time limit expires before all jobs finish"
+        let outcome = manager.manage_jobs(Some(5), &|| false);
+        assert_eq!(
+            outcome,
+            ManageJobsOutcome::TimedOut,
+            "manage_jobs should return TimedOut when the time limit expires before all jobs finish"
         );
         assert!(
             !(manager.open_jobs.is_empty() && manager.scheduled_jobs.is_empty()),
@@ -393,7 +471,7 @@ popd
             .build();
         let mut manager = SlurmManager::new(1);
         manager.add_job(&job);
-        manager.manage_jobs(Some(30));
+        manager.manage_jobs(Some(30), &|| false);
         assert!(
             !marker_exists(&marker),
             "job killed by the SLURM time limit should never reach the `touch` command"
@@ -425,7 +503,7 @@ popd
             .build();
         let mut manager = SlurmManager::new(1);
         manager.add_job(&job);
-        manager.manage_jobs(Some(60));
+        manager.manage_jobs(Some(60), &|| false);
         assert!(
             !marker_exists(&marker),
             "job exceeding its memory limit should be OOM-killed before writing the marker"
@@ -473,14 +551,123 @@ popd
     #[test]
     #[serial]
     #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
+    fn manage_jobs_aborts_and_stops_submitting() {
+        // 4 jobs, queue cap of 1: after the first is scheduled, abort_if flips
+        // true, so none of the remaining 3 should ever be submitted.
+        let mut manager = SlurmManager::new(1);
+        for _ in 0..4 {
+            manager.add_job(&sleep_job(None));
+        }
+        let checks = std::cell::Cell::new(0);
+        let outcome = manager.manage_jobs(Some(60), &|| {
+            checks.set(checks.get() + 1);
+            checks.get() > 1
+        });
+        assert_eq!(outcome, ManageJobsOutcome::Aborted);
+        assert_eq!(
+            manager
+                .finished_jobs
+                .iter()
+                .filter(|j| j.get_status() == SlurmJobStatus::ABORTED)
+                .count(),
+            4,
+            "all jobs (never-submitted and cancelled) should be marked ABORTED"
+        );
+        assert!(manager.open_jobs.is_empty());
+        assert!(manager.scheduled_jobs.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
+    fn manage_jobs_abort_cancels_scheduled_jobs() {
+        // job would touch a marker after 20s; abort should scancel it before that happens
+        let marker = marker_path();
+        let _ = std::fs::remove_file(&marker);
+        let job = SlurmJobBuilder::new(format!("sleep 20 && touch {}", marker))
+            .set_on_finished(marker_post_processing(&marker))
+            .build();
+        let mut manager = SlurmManager::new(1);
+        manager.add_job(&job);
+        let checks = std::cell::Cell::new(0);
+        let outcome = manager.manage_jobs(Some(60), &|| {
+            checks.set(checks.get() + 1);
+            checks.get() > 1
+        });
+        assert_eq!(outcome, ManageJobsOutcome::Aborted);
+        // give SLURM a moment to actually tear down the cancelled job
+        thread::sleep(Duration::from_secs(3));
+        let running = manager.get_running_jobs().expect("get running jobs");
+        assert!(
+            running.is_empty(),
+            "cancelled job should no longer be running"
+        );
+        assert!(
+            !marker_exists(&marker),
+            "cancelled job should never reach the `touch` command"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
+    fn manage_jobs_never_aborting_matches_prior_behavior() {
+        let job = sleep_job(None);
+        let mut manager = SlurmManager::new(1);
+        manager.add_job(&job);
+        let outcome = manager.manage_jobs(Some(20), &|| false);
+        assert_eq!(outcome, ManageJobsOutcome::AllFinished);
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
+    fn manage_jobs_aborts_when_job_signals_fatal() {
+        // job one signals Fatal as soon as it finishes; job two would take
+        // 20s and should be scancel'd before it can touch its own marker.
+        let fatal_marker = marker_path();
+        let _ = std::fs::remove_file(&fatal_marker);
+        let job_one = SlurmJobBuilder::new(format!("touch {}", fatal_marker))
+            .set_on_finished(fatal_if_marker_post_processing(&fatal_marker))
+            .build();
+        let survivor_marker = marker_path();
+        let _ = std::fs::remove_file(&survivor_marker);
+        let job_two = SlurmJobBuilder::new(format!("sleep 20 && touch {}", survivor_marker))
+            .set_on_finished(marker_post_processing(&survivor_marker))
+            .build();
+        let mut manager = SlurmManager::new(2);
+        manager.add_jobs(Vec::from([job_one, job_two]));
+        let outcome = manager.manage_jobs(Some(60), &|| false);
+        assert_eq!(outcome, ManageJobsOutcome::Aborted);
+        assert!(
+            !marker_exists(&survivor_marker),
+            "the second job should be cancelled before completing once the first signals Fatal"
+        );
+        assert_eq!(
+            manager
+                .finished_jobs
+                .iter()
+                .filter(|j| j.get_status() == SlurmJobStatus::ABORTED)
+                .count(),
+            1,
+            "the cancelled second job should be marked ABORTED"
+        );
+        let _ = std::fs::remove_file(&fatal_marker);
+        let _ = std::fs::remove_file(&survivor_marker);
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
     fn crashed_job_not_counted_as_successful() {
-        let always_fail = SlurmJobPostProcessing::new(&[], |_| false);
+        let always_fail = SlurmJobPostProcessing::new(&[], |_| PostProcessingOutcome::Failure);
         let job = SlurmJobBuilder::new(String::from("sleep 5"))
             .set_on_finished(always_fail)
             .build();
         let mut manager = SlurmManager::new(1);
         manager.add_job(&job);
-        manager.manage_jobs(Some(15));
+        manager.manage_jobs(Some(15), &|| false);
         assert_eq!(
             manager.successful_jobs(),
             0,
@@ -489,17 +676,24 @@ popd
     }
 
     #[test]
-    fn post_processing_check_returns_false_on_failure() {
-        let failing = SlurmJobPostProcessing::new(&[], |_| false);
-        assert!(
-            !failing.check(),
-            "post-processing returning false should propagate as false"
+    fn post_processing_check_returns_failure_on_failure() {
+        let failing = SlurmJobPostProcessing::new(&[], |_| PostProcessingOutcome::Failure);
+        assert_eq!(
+            failing.check(),
+            PostProcessingOutcome::Failure,
+            "post-processing returning Failure should propagate as Failure"
         );
     }
 
     #[test]
-    fn post_processing_check_returns_true_on_success() {
-        let succeeding = SlurmJobPostProcessing::new(&[], |_| true);
-        assert!(succeeding.check());
+    fn post_processing_check_returns_success_on_success() {
+        let succeeding = SlurmJobPostProcessing::new(&[], |_| PostProcessingOutcome::Success);
+        assert_eq!(succeeding.check(), PostProcessingOutcome::Success);
+    }
+
+    #[test]
+    fn post_processing_check_returns_fatal_on_fatal() {
+        let fatal = SlurmJobPostProcessing::new(&[], |_| PostProcessingOutcome::Fatal);
+        assert_eq!(fatal.check(), PostProcessingOutcome::Fatal);
     }
 }

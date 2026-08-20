@@ -42,24 +42,33 @@ for _ in 0..10 {
     manager.add_job(&job);
 }
 
-// blocks until all jobs finish; pass Some(seconds) to set a timeout
-let all_done: bool = manager.manage_jobs(None);
+// blocks until all jobs finish; pass Some(seconds) to set a timeout.
+// abort_if is checked each loop iteration; return true to stop submitting
+// new jobs, scancel everything in flight, and mark remaining jobs ABORTED.
+use slurm_manager::slurm_manager::ManageJobsOutcome;
+let outcome: ManageJobsOutcome = manager.manage_jobs(None, &|| false);
 ```
 
-`manage_jobs` polls `squeue` every 5 seconds, fills the queue up to `max_queue`, and runs the post-processing callback for each finished job. It returns `true` if every job completed before the timeout.
+`manage_jobs` polls `squeue` every 5 seconds, fills the queue up to `max_queue`, and runs the post-processing callback for each finished job. It returns a `ManageJobsOutcome`: `AllFinished`, `TimedOut`, or `Aborted` (when `abort_if` or a job's post-processing signaled).
 
 ### Post-processing
 
-`SlurmJobPostProcessing` runs a callback after each job disappears from `squeue`. Return `true` for success, `false` to mark the job as crashed. Use the parameter map to pass context (e.g. expected output paths to verify).
+`SlurmJobPostProcessing` runs a callback after each job disappears from `squeue`. It returns a `PostProcessingOutcome`: `Success`, `Failure` (marks the job crashed), or `Fatal` (marks it crashed *and* tells `manage_jobs` to stop submitting further jobs, `scancel` everything in flight, and return `Aborted` — use this when a job detects a systemic problem, e.g. a shared setup step failing, that would doom the rest of the queue the same way). Use the parameter map to pass context (e.g. expected output paths to verify).
 
 ```rust
 let post = SlurmJobPostProcessing::new(
     &[("output".to_string(), "/tmp/result.txt".to_string())],
-    |params| std::path::Path::new(&params["output"]).exists(),
+    |params| {
+        if std::path::Path::new(&params["output"]).exists() {
+            PostProcessingOutcome::Success
+        } else {
+            PostProcessingOutcome::Failure
+        }
+    },
 );
 ```
 
-Jobs marked crashed are excluded from `manager.successful_jobs()`.
+Jobs marked crashed or aborted are excluded from `manager.successful_jobs()`.
 
 ## Running tests
 

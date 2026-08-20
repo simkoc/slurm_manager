@@ -1,4 +1,4 @@
-use crate::job_post_processing::SlurmJobPostProcessing;
+use crate::job_post_processing::{PostProcessingOutcome, SlurmJobPostProcessing};
 use crate::job_status::SlurmJobStatus;
 use crate::memory_size::Memory;
 use std::collections::HashMap;
@@ -63,11 +63,13 @@ impl SlurmJob {
         &self.id
     }
 
-    pub(crate) fn run_post_processing(&self) -> SlurmJobStatus {
-        if self.on_finished.check() {
-            SlurmJobStatus::FINISHED
-        } else {
-            SlurmJobStatus::CRASHED
+    // returns the resulting status plus whether the job signaled a fatal,
+    // systemic error that should stop the rest of the queue.
+    pub(crate) fn run_post_processing(&self) -> (SlurmJobStatus, bool) {
+        match self.on_finished.check() {
+            PostProcessingOutcome::Success => (SlurmJobStatus::FINISHED, false),
+            PostProcessingOutcome::Failure => (SlurmJobStatus::CRASHED, false),
+            PostProcessingOutcome::Fatal => (SlurmJobStatus::CRASHED, true),
         }
     }
 

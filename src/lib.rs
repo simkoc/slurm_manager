@@ -9,12 +9,12 @@ pub mod slurm_manager;
 mod tests {
     use crate::job::SlurmJob;
     use crate::job_builder::SlurmJobBuilder;
-    use crate::job_post_processing::SlurmJobPostProcessing;
+    use crate::job_post_processing::{PostProcessingOutcome, SlurmJobPostProcessing};
     use crate::memory_size::Memory::MegaByte;
     use crate::slurm_manager::SlurmManager;
 
     fn get_post_processing() -> SlurmJobPostProcessing {
-        SlurmJobPostProcessing::new(&[], |_| true)
+        SlurmJobPostProcessing::new(&[], |_| PostProcessingOutcome::Success)
     }
 
     fn generate_job() -> SlurmJob {
@@ -36,6 +36,6 @@ mod tests {
         for _ in 0..5 {
             manager.add_job(&generate_job());
         }
-        manager.manage_jobs(None);
+        manager.manage_jobs(None, &|| false);
     }
 }
