@@ -18,6 +18,7 @@ pub struct SlurmJobBuilder {
     on_finished: SlurmJobPostProcessing,
     memory: Memory,
     cpus: usize,
+    pre_kill_signal: Option<(String, u32)>,
 }
 
 impl SlurmJobBuilder {
@@ -33,6 +34,7 @@ impl SlurmJobBuilder {
             on_finished: SlurmJobPostProcessing::do_nothing(),
             memory: Memory::MegaByte(100),
             cpus: 1,
+            pre_kill_signal: None,
         }
     }
 
@@ -116,6 +118,18 @@ impl SlurmJobBuilder {
         self
     }
 
+    // Requests a catchable signal be sent `seconds_before` seconds before the
+    // job hits its walltime and gets SIGKILL'd, giving it a chance to flush
+    // output or run last-effort diagnostics. Maps to `--signal=B:<signal>@<seconds_before>`.
+    pub fn set_pre_kill_signal(
+        mut self,
+        signal: impl Into<String>,
+        seconds_before: u32,
+    ) -> SlurmJobBuilder {
+        self.pre_kill_signal = Some((signal.into(), seconds_before));
+        self
+    }
+
     pub fn build(&self) -> SlurmJob {
         SlurmJob {
             id: Uuid::new_v4().to_string(),
@@ -131,6 +145,7 @@ impl SlurmJobBuilder {
             on_finished: self.on_finished.clone(),
             memory: self.memory.clone(),
             cpus: self.cpus,
+            pre_kill_signal: self.pre_kill_signal.clone(),
         }
     }
 }

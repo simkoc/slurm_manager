@@ -486,6 +486,46 @@ popd
 
     #[test]
     #[serial]
+    #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
+    fn pre_kill_signal_is_caught_before_walltime_kill() {
+        // the job traps SIGUSR1 and touches a marker before exiting cleanly.
+        // On this local test cluster, slurmctld's time-limit/signal check
+        // loop runs on a slow, variable cadence (observed 20-40s), so a
+        // short --time isn't a reliable way to test this: the loop may not
+        // fire the pre-kill signal until well past a tight nominal deadline.
+        // Use a generous walltime/offset and manage_jobs budget so the test
+        // isn't flaky against that cadence.
+        let marker = marker_path();
+        let _ = std::fs::remove_file(&marker);
+        // `sleep N & wait $!` (rather than a plain foreground `sleep N`) is
+        // required: bash defers trap delivery until the foreground command
+        // exits, so a plain `sleep N` would swallow the signal until it ends.
+        let job = SlurmJobBuilder::new(format!(
+            "trap 'touch {}; exit 0' USR1; sleep 120 & wait $!",
+            marker
+        ))
+        .set_max_run_time("0-00:01:00".to_string())
+        .set_pre_kill_signal("USR1", 50)
+        .set_on_finished(marker_post_processing(&marker))
+        .build();
+        let mut manager = SlurmManager::new(1);
+        manager.add_job(&job);
+        let outcome = manager.manage_jobs(Some(90), &|| false);
+        assert_eq!(outcome, ManageJobsOutcome::AllFinished);
+        assert!(
+            marker_exists(&marker),
+            "job should have caught SIGUSR1 and touched the marker before being killed by the walltime"
+        );
+        assert_eq!(
+            manager.successful_jobs(),
+            1,
+            "a job that traps the pre-kill signal and exits cleanly should count as successful"
+        );
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    #[serial]
     #[ignore = "requires a live SLURM cluster with memory-limit enforcement (cgroups) enabled (run with --include-ignored)"]
     fn memory_limit_kills_job() {
         // allocate 200MB of tmpfs-backed memory against a 50MB SLURM cap

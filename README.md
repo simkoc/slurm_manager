@@ -28,6 +28,9 @@ let job: SlurmJob = SlurmJobBuilder::new("sleep 5".to_string())
     .set_max_run_time("0-00:05:00".to_string()) // D-HH:MM:SS
     .set_memory(MegaByte(100))
     .set_on_finished(post)
+    // optional: send a catchable signal to the whole batch job 30s before
+    // it's killed for exceeding --time, giving it a chance to flush output.
+    .set_pre_kill_signal("USR1", 30)
     .build();
 ```
 

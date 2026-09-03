@@ -22,6 +22,7 @@ pub struct SlurmJob {
     pub(crate) on_finished: SlurmJobPostProcessing,
     pub(crate) memory: Memory,
     pub(crate) cpus: usize,
+    pub(crate) pre_kill_signal: Option<(String, u32)>,
 }
 
 impl Display for SlurmJob {
@@ -51,6 +52,7 @@ impl SlurmJob {
             on_finished,
             memory: Memory::MegaByte(100),
             cpus: 1,
+            pre_kill_signal: None,
         }
     }
 
@@ -130,10 +132,37 @@ impl SlurmJob {
             Some(max_run_time) => ret += format!("#SBATCH --time={}\n", max_run_time).as_str(),
             None => {}
         }
+        match &self.pre_kill_signal {
+            Some((signal, seconds_before)) => {
+                ret += format!("#SBATCH --signal=B:{}@{}\n", signal, seconds_before).as_str()
+            }
+            None => {}
+        }
         ret += "\n\n";
         ret += "echo START: `date +%Y-%m-%dT%H:%M:%S%z`\n";
         ret += self.generate_slurm_commands().as_str();
         ret += "\necho END: `date +%Y-%m-%dT%H:%M:%S%z`\n";
         ret
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::job_builder::SlurmJobBuilder;
+
+    #[test]
+    fn no_signal_flag_by_default() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string()).build();
+        assert!(!job.generate_slurm_script().contains("--signal"));
+    }
+
+    #[test]
+    fn pre_kill_signal_emits_sbatch_flag() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string())
+            .set_pre_kill_signal("USR1", 30)
+            .build();
+        assert!(job
+            .generate_slurm_script()
+            .contains("#SBATCH --signal=B:USR1@30\n"));
     }
 }
