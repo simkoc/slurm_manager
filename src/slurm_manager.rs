@@ -4,10 +4,12 @@ use crate::job_status::SlurmJobStatus::{PENDING, SUBMITTED};
 use chrono::{Local, TimeDelta};
 use log::{error, info, warn};
 use std::collections::HashSet;
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
+use uuid::Uuid;
 
 #[derive(Debug)]
 enum SlurmInteractionError {
@@ -30,16 +32,35 @@ pub struct SlurmManager {
     // set when a job's post-processing reports PostProcessingOutcome::Fatal;
     // checked by manage_jobs alongside abort_if.
     fatal_signal: bool,
+    // directory each job's generated `.slurm` submission script is written to before `sbatch`
+    // reads it; provided by the caller rather than read from an environment variable so it is
+    // never ambient, implicit, or shared without the caller's knowledge.
+    script_dir: PathBuf,
 }
 
 impl SlurmManager {
-    pub fn new(max_queue: i32) -> SlurmManager {
+    /// `script_dir` must already exist; it is where each job's `.slurm` submission script is
+    /// written (as a uniquely-named file, one per `sbatch` call) before being submitted. Callers
+    /// should point this at a directory only they (or a trusted, restricted set of processes)
+    /// can write to - it is created by this crate with default permissions, not hardened here.
+    ///
+    /// # Panics
+    /// Panics if `script_dir` does not exist or is not a directory - failing at construction
+    /// beats discovering it deep inside `manage_jobs` after jobs have already been accepted.
+    pub fn new(max_queue: i32, script_dir: impl Into<PathBuf>) -> SlurmManager {
+        let script_dir = script_dir.into();
+        assert!(
+            script_dir.is_dir(),
+            "script_dir must be an existing directory, got: {}",
+            script_dir.display()
+        );
         SlurmManager {
             open_jobs: Vec::new(),
             scheduled_jobs: Vec::new(),
             finished_jobs: Vec::new(),
             max_queue,
             fatal_signal: false,
+            script_dir,
         }
     }
 
@@ -133,20 +154,28 @@ impl SlurmManager {
         Result::Ok(finished_jobs)
     }
 
-    fn schedule_job(&self, job: &mut SlurmJob) -> Result<i32, SlurmInteractionError> {
-        let tmp_dir = match std::env::var("TMP_DIR") {
-            Ok(tmp_dir) => tmp_dir,
-            _ => String::from("/tmp/"),
-        };
-        let slurm_script = tmp_dir + "script.slurm";
-        let mut slurm_file = File::create(&slurm_script).expect("Couldn't create slurm script");
+    // Writes `job`'s script to a freshly, uniquely named file under `self.script_dir`, opened
+    // with `create_new` so the call fails rather than following or overwriting anything already
+    // at that path (e.g. a symlink placed there ahead of time) - the uniqueness makes that an
+    // extremely unlikely collision to begin with, and `create_new` closes the residual gap.
+    fn write_slurm_script(&self, job: &SlurmJob) -> PathBuf {
+        let script_path = self.script_dir.join(format!("{}.slurm", Uuid::new_v4()));
+        let mut slurm_file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&script_path)
+            .expect("Couldn't create slurm script");
         slurm_file
-            .write(job.generate_slurm_script().as_bytes())
+            .write_all(job.generate_slurm_script().as_bytes())
             .expect("Couldn't write to slurm script");
         slurm_file.flush().expect("Couldn't flush slurm script");
         slurm_file.sync_all().expect("Couldn't sync slurm script");
+        script_path
+    }
+
+    fn submit_script(script_path: &Path) -> Result<i32, SlurmInteractionError> {
         match std::process::Command::new("sbatch")
-            .arg(slurm_script)
+            .arg(script_path)
             .output()
         {
             Ok(output) => {
@@ -155,10 +184,7 @@ impl SlurmManager {
                 out = out.trim().to_string();
                 let out_split = out.split(" ").collect::<Vec<&str>>();
                 match out_split.last().unwrap().parse::<i32>() {
-                    Ok(job_id) => {
-                        job.set_status(SUBMITTED);
-                        Ok(job_id)
-                    }
+                    Ok(job_id) => Ok(job_id),
                     Err(_) => Err(SlurmInteractionError::BadSbatchResponse(String::from(out))),
                 }
             }
@@ -166,6 +192,22 @@ impl SlurmManager {
                 bad_status.to_string(),
             )),
         }
+    }
+
+    fn schedule_job(&self, job: &mut SlurmJob) -> Result<i32, SlurmInteractionError> {
+        let script_path = self.write_slurm_script(job);
+        let result = Self::submit_script(&script_path);
+        if let Err(err) = std::fs::remove_file(&script_path) {
+            warn!(
+                "failed to remove temporary slurm script {}: {}",
+                script_path.display(),
+                err
+            );
+        }
+        if result.is_ok() {
+            job.set_status(SUBMITTED);
+        }
+        result
     }
 
     fn fill_up_queue(&mut self) -> Result<i32, Vec<SlurmInteractionError>> {
@@ -294,6 +336,10 @@ mod tests {
         //todo: do we need to init anything here?
     }
 
+    fn test_script_dir() -> std::path::PathBuf {
+        std::env::temp_dir()
+    }
+
     fn sleep_job(wdir: Option<String>) -> SlurmJob {
         let job = SlurmJobBuilder::new(String::from("sleep 5"))
             .set_description(String::from("sleeps for 5 seconds"));
@@ -307,8 +353,7 @@ mod tests {
     // having actually completed its command (as opposed to being killed
     // by SLURM for exceeding a time or memory limit).
     fn marker_path() -> String {
-        let tmp_dir = std::env::var("TMP_DIR").unwrap_or_else(|_| String::from("/tmp/"));
-        format!("{}marker_{}", tmp_dir, uuid::Uuid::new_v4())
+        format!("{}/marker_{}", test_script_dir().display(), Uuid::new_v4())
     }
 
     fn marker_exists(path: &str) -> bool {
@@ -395,12 +440,62 @@ popd
     }
 
     #[test]
+    fn new_succeeds_with_an_existing_script_dir() {
+        // should not panic
+        SlurmManager::new(1, test_script_dir());
+    }
+
+    #[test]
+    #[should_panic(expected = "script_dir must be an existing directory")]
+    fn new_panics_with_a_nonexistent_script_dir() {
+        SlurmManager::new(1, format!("/this/path/should/not/exist/{}", Uuid::new_v4()));
+    }
+
+    #[test]
+    fn write_slurm_script_creates_a_uniquely_named_file_with_the_job_script() {
+        let manager = SlurmManager::new(1, test_script_dir());
+        let job = sleep_job(None);
+        let path_one = manager.write_slurm_script(&job);
+        let path_two = manager.write_slurm_script(&job);
+        assert_ne!(
+            path_one, path_two,
+            "each call should get its own uniquely named file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path_one).expect("script file should exist"),
+            job.generate_slurm_script()
+        );
+        std::fs::remove_file(&path_one).ok();
+        std::fs::remove_file(&path_two).ok();
+    }
+
+    #[test]
+    fn write_slurm_script_refuses_to_reuse_an_existing_path() {
+        let manager = SlurmManager::new(1, test_script_dir());
+        let job = sleep_job(None);
+        let path = manager.write_slurm_script(&job);
+        // simulate a pre-existing file (e.g. a planted symlink) at the very path a future call
+        // could pick; create_new inside write_slurm_script must refuse to write through it
+        // rather than following or truncating it, so this fabricated collision is our proxy for
+        // that guarantee since a real UUID collision can't be forced from a test.
+        assert!(
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .is_err(),
+            "create_new should refuse a path that already exists"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
     #[serial]
     #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
     fn create_and_run_jobs() {
         let job = sleep_job(None);
         init_logger();
-        let mut manager = SlurmManager::new(2);
+        let mut manager = SlurmManager::new(2, test_script_dir());
         manager.add_job(&job);
         let pre_start = manager.check_on_jobs().expect("Should have checked no job");
         let scheduled = manager.fill_up_queue().expect("Couldn't fill up queue");
@@ -419,7 +514,7 @@ popd
         let job_one = sleep_job(None);
         let job_two = sleep_job(None);
         init_logger();
-        let mut manager = SlurmManager::new(2);
+        let mut manager = SlurmManager::new(2, test_script_dir());
         manager.add_jobs(Vec::from([job_one, job_two]));
         let pre_start = manager.check_on_jobs().expect("Should have checked no job");
         let scheduled = manager.fill_up_queue().expect("Couldn't fill up queue");
@@ -437,7 +532,7 @@ popd
     fn manage_jobs_returns_false_when_time_runs_out() {
         // sleep 30 won't finish within the 5-second budget
         let job = SlurmJobBuilder::new(String::from("sleep 30")).build();
-        let mut manager = SlurmManager::new(1);
+        let mut manager = SlurmManager::new(1, test_script_dir());
         manager.add_job(&job);
         let outcome = manager.manage_jobs(Some(5), &|| false);
         assert_eq!(
@@ -469,7 +564,7 @@ popd
             .set_max_run_time("0-00:00:05".to_string())
             .set_on_finished(marker_post_processing(&marker))
             .build();
-        let mut manager = SlurmManager::new(1);
+        let mut manager = SlurmManager::new(1, test_script_dir());
         manager.add_job(&job);
         manager.manage_jobs(Some(30), &|| false);
         assert!(
@@ -508,7 +603,7 @@ popd
         .set_pre_kill_signal("USR1", 50)
         .set_on_finished(marker_post_processing(&marker))
         .build();
-        let mut manager = SlurmManager::new(1);
+        let mut manager = SlurmManager::new(1, test_script_dir());
         manager.add_job(&job);
         let outcome = manager.manage_jobs(Some(90), &|| false);
         assert_eq!(outcome, ManageJobsOutcome::AllFinished);
@@ -541,7 +636,7 @@ popd
             .set_memory(crate::memory_size::Memory::MegaByte(50))
             .set_on_finished(marker_post_processing(&marker))
             .build();
-        let mut manager = SlurmManager::new(1);
+        let mut manager = SlurmManager::new(1, test_script_dir());
         manager.add_job(&job);
         manager.manage_jobs(Some(60), &|| false);
         assert!(
@@ -562,7 +657,7 @@ popd
     #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
     fn queue_cap_never_exceeded() {
         let max_queue = 2;
-        let mut manager = SlurmManager::new(max_queue);
+        let mut manager = SlurmManager::new(max_queue, test_script_dir());
         for _ in 0..6 {
             manager.add_job(&sleep_job(None));
         }
@@ -594,7 +689,7 @@ popd
     fn manage_jobs_aborts_and_stops_submitting() {
         // 4 jobs, queue cap of 1: after the first is scheduled, abort_if flips
         // true, so none of the remaining 3 should ever be submitted.
-        let mut manager = SlurmManager::new(1);
+        let mut manager = SlurmManager::new(1, test_script_dir());
         for _ in 0..4 {
             manager.add_job(&sleep_job(None));
         }
@@ -627,7 +722,7 @@ popd
         let job = SlurmJobBuilder::new(format!("sleep 20 && touch {}", marker))
             .set_on_finished(marker_post_processing(&marker))
             .build();
-        let mut manager = SlurmManager::new(1);
+        let mut manager = SlurmManager::new(1, test_script_dir());
         manager.add_job(&job);
         let checks = std::cell::Cell::new(0);
         let outcome = manager.manage_jobs(Some(60), &|| {
@@ -654,7 +749,7 @@ popd
     #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
     fn manage_jobs_never_aborting_matches_prior_behavior() {
         let job = sleep_job(None);
-        let mut manager = SlurmManager::new(1);
+        let mut manager = SlurmManager::new(1, test_script_dir());
         manager.add_job(&job);
         let outcome = manager.manage_jobs(Some(20), &|| false);
         assert_eq!(outcome, ManageJobsOutcome::AllFinished);
@@ -676,7 +771,7 @@ popd
         let job_two = SlurmJobBuilder::new(format!("sleep 20 && touch {}", survivor_marker))
             .set_on_finished(marker_post_processing(&survivor_marker))
             .build();
-        let mut manager = SlurmManager::new(2);
+        let mut manager = SlurmManager::new(2, test_script_dir());
         manager.add_jobs(Vec::from([job_one, job_two]));
         let outcome = manager.manage_jobs(Some(60), &|| false);
         assert_eq!(outcome, ManageJobsOutcome::Aborted);
@@ -705,7 +800,7 @@ popd
         let job = SlurmJobBuilder::new(String::from("sleep 5"))
             .set_on_finished(always_fail)
             .build();
-        let mut manager = SlurmManager::new(1);
+        let mut manager = SlurmManager::new(1, test_script_dir());
         manager.add_job(&job);
         manager.manage_jobs(Some(15), &|| false);
         assert_eq!(

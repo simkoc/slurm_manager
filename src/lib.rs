@@ -32,7 +32,7 @@ mod tests {
     #[test]
     #[ignore = "requires a live SLURM cluster (run with --include-ignored)"]
     fn test_slurm_manager() {
-        let mut manager: SlurmManager = SlurmManager::new(3);
+        let mut manager: SlurmManager = SlurmManager::new(3, std::env::temp_dir());
         for _ in 0..5 {
             manager.add_job(&generate_job());
         }

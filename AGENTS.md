@@ -23,6 +23,6 @@ The library interacts with SLURM only through `std::process::Command` (`sbatch`,
 
 ## Development Notes
 
-- The `TMP_DIR` environment variable controls where temporary `.slurm` script files are written (default: `/tmp/`).
+- `SlurmManager::new` takes a `script_dir` the caller must already have created; each job's `.slurm` submission script is written there as a uniquely-named file (via `create_new`, so a pre-existing path at that name - e.g. a planted symlink - is refused rather than followed or overwritten) and removed again once `sbatch` has read it. There is no environment-variable fallback for this path - it must be explicit.
 - `SlurmJobPostProcessing` callbacks determine whether a finished job counts as `FINISHED` or `CRASHED`.
 - The `env` field on `SlurmJob` is stored but not emitted into the generated script. Do not rely on it until that gap is closed.

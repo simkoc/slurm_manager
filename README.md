@@ -39,7 +39,10 @@ let job: SlurmJob = SlurmJobBuilder::new("sleep 5".to_string())
 ```rust
 use slurm_manager::slurm_manager::SlurmManager;
 
-let mut manager = SlurmManager::new(3); // at most 3 jobs queued in SLURM at once
+// at most 3 jobs queued in SLURM at once; `script_dir` must already exist and is where each
+// job's `.slurm` submission script is written (as a uniquely-named file) before `sbatch` reads
+// it - point it at a directory only this process (or a trusted set of processes) can write to.
+let mut manager = SlurmManager::new(3, "/home/user/slurm_scripts");
 
 for _ in 0..10 {
     manager.add_job(&job);
@@ -82,8 +85,6 @@ cargo test
 # integration tests (require a live SLURM cluster)
 cargo test -- --include-ignored
 ```
-
-The `TMP_DIR` environment variable controls where temporary `.slurm` scripts are written (default: `/tmp/`).
 
 ## Local SLURM setup (Arch Linux)
 
