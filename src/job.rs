@@ -91,6 +91,51 @@ impl SlurmJob {
         self.number.expect("no number set for the job")
     }
 
+    /// The raw outcome of this job's post-processing callback, for callers that want to handle
+    /// `Success`/`Failure`/`Fatal` themselves rather than through the `SlurmJobStatus` mapping
+    /// `run_post_processing` applies (e.g. a non-SLURM backend with its own status model).
+    pub fn post_processing_outcome(&self) -> PostProcessingOutcome {
+        self.on_finished.check()
+    }
+
+    pub fn get_output_file(&self) -> Option<&str> {
+        self.output_file.as_deref()
+    }
+
+    pub fn get_error_file(&self) -> Option<&str> {
+        self.error_file.as_deref()
+    }
+
+    pub fn get_cpus(&self) -> usize {
+        self.cpus
+    }
+
+    pub fn get_memory(&self) -> Memory {
+        self.memory.clone()
+    }
+
+    /// `max_run_time` (`D-HH:MM:SS`) converted to a total second count, for callers that need to
+    /// enforce the same limit outside of SLURM's own `--time` accounting (e.g. a plain-bash
+    /// backend). `None` if no `max_run_time` was set.
+    pub fn max_run_time_seconds(&self) -> Option<u64> {
+        let max_run_time = self.max_run_time.as_ref()?;
+        let parts: Vec<&str> = max_run_time.splitn(2, '-').collect();
+        let days: u64 = parts[0]
+            .parse()
+            .expect("max_run_time days should be a valid number");
+        let hms: Vec<&str> = parts[1].split(':').collect();
+        let hours: u64 = hms[0]
+            .parse()
+            .expect("max_run_time hours should be a valid number");
+        let minutes: u64 = hms[1]
+            .parse()
+            .expect("max_run_time minutes should be a valid number");
+        let seconds: u64 = hms[2]
+            .parse()
+            .expect("max_run_time seconds should be a valid number");
+        Some(days * 86400 + hours * 3600 + minutes * 60 + seconds)
+    }
+
     pub(crate) fn generate_slurm_commands(&self) -> String {
         let mut ret = String::new();
         match self.working_directory {
@@ -107,7 +152,7 @@ impl SlurmJob {
         ret
     }
 
-    pub(crate) fn generate_slurm_script(&self) -> String {
+    pub fn generate_slurm_script(&self) -> String {
         let mut ret = String::from("#!/bin/bash\n");
         ret += format!("#SBATCH --job-name={}\n", self.id).as_str();
         match self.output_file {
@@ -149,6 +194,8 @@ impl SlurmJob {
 #[cfg(test)]
 mod tests {
     use crate::job_builder::SlurmJobBuilder;
+    use crate::job_post_processing::{PostProcessingOutcome, SlurmJobPostProcessing};
+    use crate::memory_size::Memory;
 
     #[test]
     fn no_signal_flag_by_default() {
@@ -161,8 +208,113 @@ mod tests {
         let job = SlurmJobBuilder::new("sleep 1".to_string())
             .set_pre_kill_signal("USR1", 30)
             .build();
-        assert!(job
-            .generate_slurm_script()
-            .contains("#SBATCH --signal=B:USR1@30\n"));
+        assert!(
+            job.generate_slurm_script()
+                .contains("#SBATCH --signal=B:USR1@30\n")
+        );
+    }
+
+    #[test]
+    fn post_processing_outcome_returns_success() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string())
+            .set_on_finished(SlurmJobPostProcessing::new(&[], |_| {
+                PostProcessingOutcome::Success
+            }))
+            .build();
+        assert_eq!(
+            job.post_processing_outcome(),
+            PostProcessingOutcome::Success
+        );
+    }
+
+    #[test]
+    fn post_processing_outcome_returns_fatal() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string())
+            .set_on_finished(SlurmJobPostProcessing::new(&[], |_| {
+                PostProcessingOutcome::Fatal
+            }))
+            .build();
+        assert_eq!(job.post_processing_outcome(), PostProcessingOutcome::Fatal);
+    }
+
+    #[test]
+    fn get_output_file_defaults_to_dev_null() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string()).build();
+        assert_eq!(job.get_output_file(), Some("/dev/null"));
+    }
+
+    #[test]
+    fn get_output_file_returns_configured_path() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string())
+            .set_output_file("out.log".to_string())
+            .build();
+        assert_eq!(job.get_output_file(), Some("out.log"));
+    }
+
+    #[test]
+    fn get_error_file_defaults_to_dev_null() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string()).build();
+        assert_eq!(job.get_error_file(), Some("/dev/null"));
+    }
+
+    #[test]
+    fn get_error_file_returns_configured_path() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string())
+            .set_error_file("err.log".to_string())
+            .build();
+        assert_eq!(job.get_error_file(), Some("err.log"));
+    }
+
+    #[test]
+    fn get_cpus_defaults_to_one() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string()).build();
+        assert_eq!(job.get_cpus(), 1);
+    }
+
+    #[test]
+    fn get_cpus_returns_configured_value() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string())
+            .set_cpus(4)
+            .build();
+        assert_eq!(job.get_cpus(), 4);
+    }
+
+    #[test]
+    fn get_memory_defaults_to_100_megabytes() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string()).build();
+        assert!(matches!(job.get_memory(), Memory::MegaByte(100)));
+    }
+
+    #[test]
+    fn get_memory_returns_configured_value() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string())
+            .set_memory(Memory::GigaByte(8))
+            .build();
+        assert!(matches!(job.get_memory(), Memory::GigaByte(8)));
+    }
+
+    #[test]
+    fn max_run_time_seconds_is_none_when_unset() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string()).build();
+        assert_eq!(job.max_run_time_seconds(), None);
+    }
+
+    #[test]
+    fn max_run_time_seconds_converts_days_hours_minutes_seconds() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string())
+            .set_max_run_time("1-02:03:04".to_string())
+            .build();
+        assert_eq!(
+            job.max_run_time_seconds(),
+            Some(86400 + 2 * 3600 + 3 * 60 + 4)
+        );
+    }
+
+    #[test]
+    fn max_run_time_seconds_handles_zero_days() {
+        let job = SlurmJobBuilder::new("sleep 1".to_string())
+            .set_max_run_time("0-00:05:00".to_string())
+            .build();
+        assert_eq!(job.max_run_time_seconds(), Some(300));
     }
 }
